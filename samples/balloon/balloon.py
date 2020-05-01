@@ -45,6 +45,9 @@ from mrcnn import model as modellib, utils
 # Path to trained weights file
 COCO_WEIGHTS_PATH = os.path.join(ROOT_DIR, "mask_rcnn_coco.h5")
 
+# Path to dataset folder
+BALLOON_DIR = os.path.join(ROOT_DIR, "datasets/balloon")
+
 # Directory to save logs and model checkpoints, if not provided
 # through the command line argument --logs
 DEFAULT_LOGS_DIR = os.path.join(ROOT_DIR, "logs")
@@ -63,10 +66,10 @@ class BalloonConfig(Config):
 
     # We use a GPU with 12GB memory, which can fit two images.
     # Adjust down if you use a smaller GPU.
-    IMAGES_PER_GPU = 2
+    IMAGES_PER_GPU = 1
 
     # Number of classes (including background)
-    NUM_CLASSES = 1 + 1  # Background + balloon
+    NUM_CLASSES = 1 + 1 + 1 + 1  # Background + object + floor + wall
 
     # Number of training steps per epoch
     STEPS_PER_EPOCH = 100
@@ -87,7 +90,9 @@ class BalloonDataset(utils.Dataset):
         subset: Subset to load: train or val
         """
         # Add classes. We have only one class to add.
-        self.add_class("balloon", 1, "balloon")
+        self.add_class("balloon", 1, "floor")
+        self.add_class("balloon", 2, "object")
+        self.add_class("balloon", 3, "wall")
 
         # Train or validation dataset?
         assert subset in ["train", "val"]
@@ -110,10 +115,23 @@ class BalloonDataset(utils.Dataset):
         # We mostly care about the x and y coordinates of each region
         # Note: In VIA 2.0, regions was changed from a dict to a list.
         annotations = json.load(open(os.path.join(dataset_dir, "via_region_data.json")))
-        annotations = list(annotations.values())  # don't need the dict keys
+        # annotations = list(annotations.values())  # don't need the dict keys
 
         # The VIA tool saves images in the JSON even if they don't have any
         # annotations. Skip unannotated images.
+        via_1_check = annotations.get('regions')
+        via_2_check = annotations.get('_via_img_metadata')
+
+        # JSON is formatted with VIA-1.x
+        if via_1_check:
+            annotations = list(annotations.values())
+        # JSON is formatted with VIA-2.x
+        elif via_2_check:
+            annotations = list(annotations['_via_img_metadata'].values())
+        # Unknown JSON formatting
+        else:
+            raise ValueError('The JSON provided is not in a recognised via-1.x or via-2.x format.')
+
         annotations = [a for a in annotations if a['regions']]
 
         # Add images
@@ -124,8 +142,10 @@ class BalloonDataset(utils.Dataset):
             # The if condition is needed to support VIA versions 1.x and 2.x.
             if type(a['regions']) is dict:
                 polygons = [r['shape_attributes'] for r in a['regions'].values()]
+                names = [r['region_attributes'] for r in a['regions'].values()]
             else:
                 polygons = [r['shape_attributes'] for r in a['regions']] 
+                names = [r['region_attributes'] for r in a['regions']]
 
             # load_mask() needs the image size to convert polygons to masks.
             # Unfortunately, VIA doesn't include it in JSON, so we must read
@@ -139,7 +159,8 @@ class BalloonDataset(utils.Dataset):
                 image_id=a['filename'],  # use file name as a unique image id
                 path=image_path,
                 width=width, height=height,
-                polygons=polygons)
+                polygons=polygons,
+                names=names)
 
     def load_mask(self, image_id):
         """Generate instance masks for an image.
@@ -156,6 +177,7 @@ class BalloonDataset(utils.Dataset):
         # Convert polygons to a bitmap mask of shape
         # [height, width, instance_count]
         info = self.image_info[image_id]
+        class_names = info["names"]
         mask = np.zeros([info["height"], info["width"], len(info["polygons"])],
                         dtype=np.uint8)
         for i, p in enumerate(info["polygons"]):
@@ -163,9 +185,23 @@ class BalloonDataset(utils.Dataset):
             rr, cc = skimage.draw.polygon(p['all_points_y'], p['all_points_x'])
             mask[rr, cc, i] = 1
 
+        # Assign class_ids by reading class_names
+        class_ids = np.zeros([len(info["polygons"])])
+        # In the surgery dataset, pictures are labeled with name 'a' and 'r' representing arm and ring.
+        for i, p in enumerate(class_names):
+        #"name" is the attributes name decided when labeling, etc. 'region_attributes': {name:'a'}
+            if p['name'] == 'floor':
+                class_ids[i] = 1
+            elif p['name'] == 'object':
+                class_ids[i] = 2
+            elif p['name'] == 'wall':
+                class_ids[i] = 3
+            #assert code here to extend to other labels
+        class_ids = class_ids.astype(int)
+
         # Return mask, and array of class IDs of each instance. Since we have
         # one class ID only, we return an array of 1s
-        return mask.astype(np.bool), np.ones([mask.shape[-1]], dtype=np.int32)
+        return mask.astype(np.bool), class_ids
 
     def image_reference(self, image_id):
         """Return the path of the image."""
@@ -176,16 +212,16 @@ class BalloonDataset(utils.Dataset):
             super(self.__class__, self).image_reference(image_id)
 
 
-def train(model):
+def train(model, config):
     """Train the model."""
     # Training dataset.
     dataset_train = BalloonDataset()
-    dataset_train.load_balloon(args.dataset, "train")
+    dataset_train.load_balloon(BALLOON_DIR, "train")
     dataset_train.prepare()
 
     # Validation dataset
     dataset_val = BalloonDataset()
-    dataset_val.load_balloon(args.dataset, "val")
+    dataset_val.load_balloon(BALLOON_DIR, "val")
     dataset_val.prepare()
 
     # *** This training schedule is an example. Update to your needs ***
@@ -269,6 +305,34 @@ def detect_and_color_splash(model, image_path=None, video_path=None):
                 count += 1
         vwriter.release()
     print("Saved to ", file_name)
+
+
+############################################################
+#  Run for jupyter
+############################################################
+def run_train_coco():
+    print("Running")
+
+    # Validate arguments
+
+    # Configurations
+    config = BalloonConfig()
+    config.display()
+
+    # Create model
+    model = modellib.MaskRCNN(mode="training", config=config, model_dir=DEFAULT_LOGS_DIR)
+
+    # Download weights file if not exist
+    if not os.path.exists(COCO_WEIGHTS_PATH):
+        utils.download_trained_weights(COCO_WEIGHTS_PATH)
+
+    # Load weights
+    model.load_weights(COCO_WEIGHTS_PATH, by_name=True, exclude=["mrcnn_class_logits", "mrcnn_bbox_fc", "mrcnn_bbox", "mrcnn_mask"])
+
+    # Train
+    train(model, config)
+
+    print("DONE TRAINING") 
 
 
 ############################################################
